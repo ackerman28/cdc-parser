@@ -2,3 +2,4 @@ pdfplumber
 pandas
 openpyxl
 rapidfuzz
+ocrmypdf

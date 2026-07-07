@@ -26,7 +26,7 @@ def ensure_required_columns(df, required_cols):
 def clean_dataframe(df):
 
     # ---------- STANDARD CLEAN ----------
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
 
     df.replace(r'^\s*$', pd.NA, regex=True, inplace=True)
 
@@ -447,6 +447,6 @@ def clean_dataframe(df):
     )
 
     # ---------- FINAL TRIM ----------
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
 
     return df

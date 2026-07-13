@@ -1,69 +1,75 @@
 """
-pipeline.py — Full pipeline: OCR -> extract -> clean -> validate, over every
-bulletin in PDF_FOLDER, writing one combined dataset plus a validation report.
+pipeline.py — Full pipeline: OCR -> extract -> clean -> validate.
 
 Run from the project root:
     python -m src.pipeline
 
-The steps:
-  1. OCR   (ocr.py)      -- add a text layer to each scanned bulletin (cached)
-  2. EXTRACT (extract.py)-- pull the "Events Highlighted This Week" table
-  3. CLEAN  (clean.py)   -- repair OCR/column-drift, standardize columns
-  4. VALIDATE (validate.py) -- flag any remaining bad rows into a report
+WHAT CHANGED IN WEEK 4
+----------------------
+Extraction is now COORDINATE-BASED (extract.py), not flat-text based. Tesseract
+reads a table in column-blocks, so reading its output as flat text detached the
+case counts from their rows -- the numbers came out as garbage. We now read every
+word WITH ITS X/Y POSITION and rebuild the table from the page geometry.
+
+Because the columns now land in the right places, the long chain of post-hoc OCR
+patches is no longer needed: clean.py is short and predictable.
+
+Note: extract.py OCRs the page images itself, so it works directly on the RAW
+scanned bulletin. A separate OCR'd PDF is no longer required.
 """
 
 import os
 import pandas as pd
 
-from src.config import PDF_FOLDER, OCR_CACHE, OUTPUT_FILE, VALIDATION_REPORT
-from src.ocr import ensure_searchable, is_searchable
-from src.extract import extract_date_from_filename, extract_highlighted_table
-from src.clean import clean_dataframe
+from src.config import PDF_FOLDER, OUTPUT_FILE, VALIDATION_REPORT
+from src.extract import extract_highlighted_table, extract_date_from_filename
+from src.clean import clean_table
 from src.validate import validate
 
 
 def run():
     master_dfs = []
+    failed = []
 
     for filename in sorted(os.listdir(PDF_FOLDER)):
         if not filename.lower().endswith(".pdf"):
             continue
 
-        raw_path = os.path.join(PDF_FOLDER, filename)
+        path = os.path.join(PDF_FOLDER, filename)
         print("Processing:", filename)
 
-        # STEP 1: make sure the PDF has a text layer (OCR if needed, cached)
-        if is_searchable(raw_path):
-            pdf_path = raw_path            # already has text, use as-is
-        else:
-            pdf_path = ensure_searchable(raw_path, OCR_CACHE)
-
-        # STEP 2: extract the highlighted table
-        report_date = extract_date_from_filename(filename)
-        df = extract_highlighted_table(str(pdf_path))
-
-        if df is None:
-            print("  [warning] No table detected even after OCR")
+        try:
+            raw = extract_highlighted_table(path)
+        except Exception as e:
+            print(f"  [error] {e}")
+            failed.append(filename)
             continue
 
-        # STEP 3: clean
-        df = clean_dataframe(df)
-        df.insert(0, "Report Date", report_date)
-        master_dfs.append(df)
+        if raw is None or raw.empty:
+            print("  [warning] no highlighted-events table found")
+            failed.append(filename)
+            continue
 
-    if len(master_dfs) == 0:
+        df = clean_table(raw)
+        df.insert(0, "Report Date", extract_date_from_filename(filename))
+        master_dfs.append(df)
+        print(f"  -> {len(df)} rows")
+
+    if not master_dfs:
         raise Exception("No tables extracted from any PDFs.")
 
-    master_df = pd.concat(master_dfs, ignore_index=True)
-    master_df.sort_values("Report Date", inplace=True)
+    master = pd.concat(master_dfs, ignore_index=True)
+    master.sort_values(["Report Date", "Agent/Syndrome", "Country"], inplace=True)
 
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    master_df.to_excel(OUTPUT_FILE, index=False)
-    print("\nMASTER DATASET CREATED:", OUTPUT_FILE)
-    print("Rows:", len(master_df))
+    master.to_excel(OUTPUT_FILE, index=False)
 
-    # STEP 4: validate and write the quality report
-    report = validate(master_df)
+    print(f"\nMASTER DATASET: {OUTPUT_FILE}")
+    print(f"Rows: {len(master)}   Bulletins parsed: {len(master_dfs)}")
+    if failed:
+        print(f"Bulletins that produced no table ({len(failed)}): {failed}")
+
+    report = validate(master)
     report.print_summary()
     report.to_excel(str(VALIDATION_REPORT))
 

@@ -1,139 +1,231 @@
 """
-extract.py — Pull the "Events Highlighted This Week" table out of an Africa CDC
-EBS bulletin PDF.
+extract2.py — Coordinate-based extraction of the "Events Highlighted This Week" table.
 
-Ported faithfully from Camellia's master notebook (Stage 0: Extraction).
-LOGIC UNCHANGED. Only difference from the notebook: no Google Drive / Colab code,
-and the file paths are configured in pipeline.py instead of hard-coded here.
+WHY THIS REPLACES THE OLD APPROACH
+----------------------------------
+The old extract.py read the OCR'd page as FLAT TEXT. Tesseract, however, reads a
+table in column-blocks: it emits the left-hand columns row by row, then dumps the
+Probable/Confirmed/Deaths columns separately at the bottom of the page. Reading
+flat text therefore DETACHES the case counts from their rows -- which is why the
+numbers came out as garbage ("dBFF8O8FGFG") or vanished entirely.
 
-NOTE: These functions assume the PDF already has a text layer (i.e. OCR has been
-run). Raw CDC bulletins are scanned images with no text layer, so extraction will
-return None on a raw file. Automated OCR is added in a later stage of the project.
+This module instead uses Tesseract's `image_to_data`, which returns EVERY WORD
+WITH ITS X/Y COORDINATES. We then:
+  1. locate the "Events Highlighted this week" header and read the column
+     x-positions directly off it (so we adapt to each bulletin's layout rather
+     than hard-coding positions),
+  2. group words into rows by y-position,
+  3. assign each word to a column by x-position.
+
+The table structure is recovered from the page geometry, not guessed from spacing.
+That is what makes it robust across bulletins.
+
+MULTI-ROW DISEASES
+------------------
+A disease (e.g. Mpox) spans many countries, and the bulletin prints the disease
+name only on its FIRST row, leaving it blank for subsequent countries. We forward
+-fill the disease name down those rows, which is why the old output had 8 rows
+with a missing country/disease.
 """
 
-import os
 import re
-import pdfplumber
 import pandas as pd
+from pdf2image import convert_from_path
+import pytesseract
+from pytesseract import Output
 
 
-def extract_date_from_filename(filename):
-    m = re.search(r"(20\d{2}-\d{2}-\d{2})", filename)
-    return m.group(1) if m else None
+DPI = 300
+MIN_CONF = 30          # drop very low-confidence OCR words
+ROW_TOLERANCE = 28     # px: words within this vertical distance are the same row
+
+# The columns of the highlighted-events table, in order.
+COLUMNS = [
+    "Agent/Syndrome", "Country", "Risk:Human", "Risk:Animal",
+    "Type", "Suspected", "Probable", "Confirmed", "Deaths",
+]
 
 
-# ---------- OCR NORMALIZATION ----------
-def normalize_ocr_text(text):
-    if text is None:
-        return ""
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9]", "", text)
-    return text
+def _page_words(img):
+    """All OCR'd words on the page, with coordinates. One row per word."""
+    d = pytesseract.image_to_data(img, output_type=Output.DATAFRAME)
+    d = d[d.conf > MIN_CONF].dropna(subset=["text"])
+    d["text"] = d["text"].astype(str).str.strip()
+    d = d[d["text"] != ""]
+    return d
 
 
-# ---------- HEADER DETECTION ----------
-def is_header_row(row):
+def _find_table_header(words):
+    """Locate the header of the *highlighted events* table.
 
-    row_text = " ".join([str(x) for x in row if x is not None])
-    norm = normalize_ocr_text(row_text)
+    The page can contain two tables ("New events since last issue" first, then
+    "Events Highlighted this week"). We anchor on the 'Highlighted' title and take
+    the first header row BELOW it, so we never pick up the wrong table.
+    """
+    hl = words[words["text"].str.contains("Highlighted", case=False, na=False)]
+    if hl.empty:
+        return None, None
+    title_y = hl["top"].min()
 
-    header_signals = [
-        "agent",
-        "syndrome",
-        "country",
-        "risk",
-        "suspected",
-        "confirmed",
-        "deaths",
-        "new"
+    # Header words for the real table sit just under the title.
+    # Header wording varies between bulletin years:
+    #   2025 layout -> Tesseract reads "Risk:Human" / "Risk:Animal" as single words
+    #   2026 layout -> it reads only a bare "Risk" (the ":Human" wraps to another line)
+    # We therefore accept a bare "Risk" too, and disambiguate the two Risk columns
+    # by their x-position below (leftmost = Human, next = Animal).
+    hdr = words[
+        (words["top"] > title_y)
+        & (words["text"].str.fullmatch(
+            r"Agent/Syndrome|Country|Risk:?Human|Risk:?Animal|Risk|Type|"
+            r"Suspected|Probable|Confirmed|Deaths",
+            case=False, na=False))
     ]
+    if hdr.empty:
+        return None, None
 
-    score = sum(word in norm for word in header_signals)
-    return score >= 2
+    # The header spans a couple of text lines ("Suspected" over "(New)"), so take
+    # everything within ~60px of the topmost header word.
+    hdr_top = hdr["top"].min()
+    hdr = hdr[hdr["top"] < hdr_top + 60]
+
+    # Column x-position = left edge of each header word, in reading order.
+    bounds = {}
+
+    # Handle the bare-"Risk" layout: the two Risk headers are distinguished only
+    # by position. Leftmost -> Risk:Human, the one after it -> Risk:Animal.
+    bare = sorted(
+        hdr.loc[hdr["text"].str.fullmatch(r"Risk", case=False, na=False), "left"].tolist()
+    )
+    if bare:
+        bounds["Risk:Human"] = bare[0]
+        if len(bare) > 1:
+            bounds["Risk:Animal"] = bare[1]
+
+    for _, r in hdr.iterrows():
+        name = r["text"].strip()
+        if re.fullmatch(r"Risk", name, flags=re.I):
+            continue                      # already handled above
+        # normalize "RiskHuman"/"Risk:Human" -> "Risk:Human"
+        m = re.fullmatch(r"Risk:?(Human|Animal)", name, flags=re.I)
+        if m:
+            name = "Risk:" + m.group(1).capitalize()
+        # keep the leftmost occurrence of each header name
+        if name not in bounds or r["left"] < bounds[name]:
+            bounds[name] = r["left"]
+
+    header_bottom = hdr["top"].max() + 40
+    return bounds, header_bottom
 
 
-# ---------- FIND "EVENTS HIGHLIGHTED" SECTION ----------
-def find_highlighted_start_page(pdf):
+def _column_edges(bounds):
+    """Turn header x-positions into [start, end) ranges for each column."""
+    # Normalize header names to our COLUMNS order
+    order = []
+    for c in COLUMNS:
+        # header may say "Risk:Human" etc.
+        for k in bounds:
+            if k.lower().replace(" ", "") == c.lower().replace(" ", ""):
+                order.append((c, bounds[k]))
+                break
+    order.sort(key=lambda t: t[1])
 
-    phrase = "eventshighlightedthisweek"
+    edges = []
+    for i, (name, x) in enumerate(order):
+        # A column's LEFT boundary is the midpoint between its own header and the
+        # previous header; its RIGHT boundary is the midpoint to the next header.
+        # Using midpoints (rather than a fixed pixel margin) means the boundaries
+        # adapt automatically when a bulletin's column layout shifts -- which it
+        # does between report years. A fixed margin caused the risk level to be
+        # absorbed into the Country cell ("Angola High") on the 2026 layout.
+        if i == 0:
+            start = 0
+        else:
+            start = (order[i - 1][1] + x) // 2
 
-    # Skip cover page, start checking from page 2 onward
-    for i in range(1, len(pdf.pages)):
+        if i + 1 < len(order):
+            end = (x + order[i + 1][1]) // 2
+        else:
+            end = 10 ** 6
 
-        text = pdf.pages[i].extract_text()
-        norm = normalize_ocr_text(text)
+        edges.append((name, start, end))
+    return edges
 
-        if phrase in norm:
-            return i
+
+def _assign(words, edges, header_bottom):
+    """Group words into rows (by y) and columns (by x). Returns a DataFrame."""
+    body = words[words["top"] > header_bottom].copy()
+    if body.empty:
+        return pd.DataFrame(columns=[e[0] for e in edges])
+
+    # --- group into rows by vertical position ---
+    body = body.sort_values("top")
+    rows, current, last_top = [], [], None
+    for _, w in body.iterrows():
+        if last_top is None or abs(w["top"] - last_top) <= ROW_TOLERANCE:
+            current.append(w)
+            last_top = w["top"] if last_top is None else last_top
+        else:
+            rows.append(current)
+            current = [w]
+            last_top = w["top"]
+    if current:
+        rows.append(current)
+
+    # --- assign each word in a row to a column by x ---
+    out = []
+    for row in rows:
+        cells = {name: [] for name, _, _ in edges}
+        for w in row:
+            x = w["left"]
+            for name, start, end in edges:
+                if start <= x < end:
+                    cells[name].append((x, w["text"]))
+                    break
+        record = {}
+        for name in cells:
+            parts = [t for _, t in sorted(cells[name])]
+            record[name] = " ".join(parts).strip()
+        # skip rows that are entirely empty or are page furniture
+        if any(record.values()):
+            out.append(record)
+
+    return pd.DataFrame(out)
+
+
+def extract_highlighted_table(pdf_path):
+    """Extract the highlighted-events table from a bulletin PDF.
+
+    Works directly on the RAW scanned PDF -- no separate OCR'd file needed,
+    because we OCR the page images here.
+    """
+    # The table is on the 'Event Summary' page; scan the first several pages.
+    pages = convert_from_path(pdf_path, dpi=DPI, first_page=1, last_page=4)
+
+    for img in pages:
+        words = _page_words(img)
+        if words.empty:
+            continue
+        bounds, header_bottom = _find_table_header(words)
+        if not bounds:
+            continue
+
+        edges = _column_edges(bounds)
+        if len(edges) < 5:      # not a real table
+            continue
+
+        df = _assign(words, edges, header_bottom)
+        if len(df) >= 3:        # a real table has several rows
+            return df
 
     return None
 
 
-# ---------- VALIDATE THAT TABLE IS REAL ----------
-def is_real_highlighted_table(df):
+def extract_date_from_filename(filename):
+    """Pull the report date (YYYY-MM-DD) out of the bulletin filename.
 
-    if df is None or len(df) < 2:
-        return False
-
-    joined = " ".join(df.astype(str).fillna("").values.flatten())
-    norm = normalize_ocr_text(joined)
-
-    required_terms = ["agent", "country", "risk", "syndrome", "deaths", "confirmed", "suspected", "new"]
-    score = sum(term in norm for term in required_terms)
-
-    return score >= 2 and df.shape[1] >= 5
-
-
-# ---------- EXTRACT HIGHLIGHTED TABLE ----------
-def extract_highlighted_table(pdf_path):
-
-    with pdfplumber.open(pdf_path) as pdf:
-
-        start_idx = find_highlighted_start_page(pdf)
-
-        # No highlighted section exists → skip this PDF
-        if start_idx is None:
-            return None
-
-        df = None
-
-        # Search the section page and the following page
-        for idx in [start_idx, start_idx + 1]:
-
-            if idx >= len(pdf.pages):
-                continue
-
-            page = pdf.pages[idx]
-
-            tables = page.extract_tables({
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "intersection_tolerance": 5
-            })
-
-            if len(tables) == 0:
-                continue
-
-            candidate = pd.DataFrame(tables[0])
-
-            if is_real_highlighted_table(candidate):
-                df = candidate
-                break
-
-        if df is None:
-            return None
-
-    # ---------- CLEAN USING YOUR ORIGINAL HEADER LOGIC ----------
-    header_rows = []
-    for i, row in df.iterrows():
-        if is_header_row(row):
-            header_rows.append(i)
-
-    if len(header_rows) >= 2:
-        df = df.iloc[header_rows[1] + 1:].reset_index(drop=True)
-    elif len(header_rows) == 1:
-        df = df.iloc[header_rows[0] + 1:].reset_index(drop=True)
-
-    df = df[~df.apply(is_header_row, axis=1)].reset_index(drop=True)
-
-    return df
+    Handles both naming styles seen in the archive:
+        EBS_Weekly_Report_2025-07-15.pdf
+        EBS Weekly Report 2026-02-04.pdf
+    """
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
+    return m.group(1) if m else None

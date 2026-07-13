@@ -3,3 +3,6 @@ pandas
 openpyxl
 rapidfuzz
 ocrmypdf
+
+pytesseract
+pdf2image

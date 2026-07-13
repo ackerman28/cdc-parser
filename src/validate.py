@@ -58,6 +58,20 @@ VALID_TYPES = {"Human", "Animal", "Environment", "Environmental"}
 # Valid risk levels. Anything else in a Risk column is truncated/garbled OCR.
 VALID_RISK = {"Low", "Very Low", "Moderate", "High", "Very High"}
 
+# Every column the pipeline is expected to produce. If one is MISSING entirely
+# (not just empty), that is a silent extraction failure -- e.g. a bulletin whose
+# header wording changed, so the column was never created. Without this check a
+# vanished column produces "0 errors", because the other checks only look at
+# columns that exist.
+EXPECTED_COLUMNS = [
+    "Report Date", "Agent/Syndrome", "Country",
+    "Risk Human", "Risk Animal",
+    "tot_suspected", "new_suspected",
+    "tot_probable", "new_probable",
+    "tot_confirmed", "new_confirmed",
+    "tot_deaths", "new_deaths",
+]
+
 # The numeric columns that must contain numbers (or be blank), never text.
 NUMERIC_COLUMNS = [
     "tot_suspected", "new_suspected", "tot_probable", "new_probable",
@@ -238,6 +252,17 @@ def _check_confirmed_vs_suspected(df, issues):
                                    f"tot_suspected ({df.at[i,'tot_suspected']}) - review"))
 
 
+def _check_schema(df, issues):
+    """Flag any expected column that is missing from the dataset entirely."""
+    for col in EXPECTED_COLUMNS:
+        if col not in df.columns:
+            issues.append(dict(row=-1, severity="ERROR", column=col,
+                               check="missing_column", value=None,
+                               message=f"Expected column '{col}' is missing from the "
+                                       f"dataset - extraction likely failed to find it "
+                                       f"(header wording may differ in this bulletin)"))
+
+
 def _check_date(df, issues):
     if "Report Date" not in df.columns:
         return
@@ -256,6 +281,7 @@ def validate(df):
     Does not modify df.
     """
     issues = []
+    _check_schema(df, issues)
     _check_date(df, issues)
     _check_country(df, issues)
     _check_type(df, issues)

@@ -20,26 +20,75 @@ import pandas as pd
 
 # Diseases that appear in the bulletins. We match the disease name inside the
 # OCR'd string and discard whatever icon-junk sits around it.
-KNOWN_DISEASES = [
-    "Vibrio cholerae", "Cholera", "Measles virus", "Measles", "Mpox virus", "Mpox",
-    "Dengue virus", "Dengue", "Meningitis (Bacterial)", "Meningitis",
-    "Chikungunya virus", "Chikungunya", "Ebola virus", "Ebola",
-    "Corynebacterium diphtheriae", "Diphtheria", "Polio", "Yellow fever",
-    "Lassa fever", "Marburg", "Rift Valley fever", "Anthrax", "Hepatitis",
-    "COVID-19", "Influenza", "Malaria", "Typhoid", "Rabies", "Plague",
+# Disease names as they appear in the bulletins. Order matters: we match the
+# LONGEST names first so "Meningitis (Bacterial)" wins over bare "Meningitis"
+# and "Corynebacterium diphtheriae" is not mistaken for something shorter.
+#
+# Each entry maps a pattern found in the OCR'd cell -> the canonical name we store.
+# A long name can WRAP ONTO TWO LINES in the PDF (e.g. "Corynebacterium" on one
+# line, "diphtheriae" on the next), so we must recognise EITHER fragment on its own.
+DISEASE_PATTERNS = [
+    # --- multi-word / most specific FIRST ---
+    ("Corynebacterium diphtheriae", "Diphtheria"),
+    ("Corynebacterium",             "Diphtheria"),   # first line of a wrapped name
+    ("diphtheriae",                 "Diphtheria"),   # second line of a wrapped name
+    ("Diphtheria",                  "Diphtheria"),
+    ("Meningitis (Bacterial)",      "Meningitis (Bacterial)"),
+    ("Meningitis",                  "Meningitis (Bacterial)"),
+    ("Polio virus (vaccine-derived)", "Polio (vaccine-derived)"),
+    ("vaccine-derived",             "Polio (vaccine-derived)"),
+    ("Poliovirus",                  "Polio (vaccine-derived)"),
+    ("Polio",                       "Polio (vaccine-derived)"),
+    ("Rift Valley Fever virus",     "Rift Valley fever"),
+    ("Rift Valley",                 "Rift Valley fever"),
+    ("Sudan Ebola virus",           "Ebola"),
+    ("Sudan Ebola",                 "Ebola"),
+    ("Ebola",                       "Ebola"),
+    ("Vibrio cholerae",             "Cholera"),
+    ("cholerae",                    "Cholera"),
+    ("Cholera",                     "Cholera"),
+    ("Lassa virus",                 "Lassa fever"),
+    ("Lassa",                       "Lassa fever"),
+    ("West Nile virus",             "West Nile"),
+    ("West Nile",                   "West Nile"),
+    ("Influenza H5N1",              "Influenza H5N1"),
+    ("H5N1",                        "Influenza H5N1"),
+    ("Yellow fever",                "Yellow fever"),
+    ("Marburg",                     "Marburg"),
+    ("Chikungunya",                 "Chikungunya"),
+    ("Measles",                     "Measles"),
+    ("Mpox",                        "Mpox"),
+    ("Monkeypox",                   "Mpox"),
+    ("Dengue",                      "Dengue"),
+    ("Anthrax",                     "Anthrax"),
+    ("Hepatitis",                   "Hepatitis"),
+    ("COVID-19",                    "COVID-19"),
+    ("SARS-CoV-2",                  "COVID-19"),
+    ("Influenza",                   "Influenza"),
+    ("Malaria",                     "Malaria"),
+    ("Typhoid",                     "Typhoid"),
+    ("Rabies",                      "Rabies"),
+    ("Plague",                      "Plague"),
 ]
+
+KNOWN_DISEASES = [canonical for _, canonical in DISEASE_PATTERNS]
 
 VALID_RISK = ["Very High", "Very Low", "Moderate", "High", "Low"]
 
 
 def _clean_disease(s):
-    """Recover the disease name from an OCR'd cell like '$8 Measles virus'."""
+    """Recover the canonical disease name from an OCR'd cell.
+
+    The cell arrives with the disease ICON glued on ("$8 Measles virus", "* mpox")
+    and long names may be split across two lines, so we search for any known
+    disease pattern inside the text and map it to a canonical name.
+    """
     if not isinstance(s, str) or not s.strip():
         return None
-    for d in KNOWN_DISEASES:                 # longest names first (list is ordered)
-        if re.search(re.escape(d), s, flags=re.I):
-            return d
-    return None                              # unrecognized -> leave blank, validator flags it
+    for pattern, canonical in DISEASE_PATTERNS:   # ordered longest/most-specific first
+        if re.search(re.escape(pattern), s, flags=re.I):
+            return canonical
+    return None                              # unrecognized -> blank; validator flags it
 
 
 def _clean_risk(s):
@@ -93,13 +142,62 @@ def _split_count(s):
     return (None, None)
 
 
+# Columns the extractor is expected to hand us. If a bulletin's layout means one
+# was never detected, we create it EMPTY rather than crashing -- the validator's
+# missing/blank checks will then surface it as a data problem instead of the whole
+# bulletin dying with a KeyError.
+REQUIRED_INPUT_COLUMNS = [
+    "Agent/Syndrome", "Country", "Risk:Human", "Risk:Animal",
+    "Type", "Suspected", "Probable", "Confirmed", "Deaths",
+]
+
+
+REQUIRED_RAW_COLUMNS = ["Agent/Syndrome", "Country"]
+
+
 def clean_table(df):
-    """Raw extracted table -> tidy analysis-ready rows."""
+    """Raw extracted table -> tidy analysis-ready rows.
+
+    Returns an EMPTY dataframe if the extracted table lacks the columns we need.
+    Some bulletins contain a different table (e.g. only "New events since last
+    issue") whose header does not include Agent/Syndrome; previously that raised
+    a KeyError and crashed the whole batch run.
+    """
     df = df.copy()
 
-    # 1. disease name: strip icons, then forward-fill down the country rows
-    df["Agent/Syndrome"] = df["Agent/Syndrome"].apply(_clean_disease)
-    df["Agent/Syndrome"] = df["Agent/Syndrome"].ffill()
+    missing = [c for c in REQUIRED_RAW_COLUMNS if c not in df.columns]
+    if missing:
+        return pd.DataFrame()
+
+    # Defensive: never assume a column exists. Bulletin layouts vary by year, and
+    # a missing header used to crash the whole file (KeyError: 'Agent/Syndrome').
+    for col in REQUIRED_INPUT_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    # 1. disease name: strip icons, then forward-fill down the country rows.
+    #
+    #    IMPORTANT: forward-fill is only correct for the bulletin's real layout,
+    #    where a disease is printed once and its countries listed beneath it. If a
+    #    disease name fails to be RECOGNIZED, a naive ffill would paste the
+    #    PREVIOUS disease over it -- silently mislabelling the row (this is how
+    #    "Corynebacterium diphtheriae / Mali" once became "Cholera / Mali").
+    #    So we distinguish "blank because it continues the row above" from
+    #    "non-blank but unrecognized", and flag the latter as UNKNOWN so the
+    #    validator can catch it rather than letting it pass as valid data.
+    raw_names = df["Agent/Syndrome"]
+    cleaned = raw_names.apply(_clean_disease)
+
+    had_text = raw_names.notna() & (raw_names.astype(str).str.strip() != "")
+    unrecognized = had_text & cleaned.isna()
+    # Keep the ORIGINAL OCR text alongside the marker, so the validation report
+    # tells you exactly what to add to DISEASE_PATTERNS instead of just "UNKNOWN".
+    cleaned = cleaned.mask(
+        unrecognized,
+        "UNKNOWN: " + raw_names.where(unrecognized).astype(str).str.strip()
+    )
+
+    df["Agent/Syndrome"] = cleaned.ffill()
 
     # 2. risk levels.
     #    If a layout shift pushed the risk level into the Country cell
@@ -114,7 +212,10 @@ def clean_table(df):
         if col in df.columns:
             df[col] = df[col].apply(_clean_risk)
 
-    # 3. split "total (new)" into two numeric columns each
+    # 3. repair counts that OCR packed into the wrong column (multi-word
+    #    country names push figures sideways), then split "total (new)".
+    df = _repair_shifted_counts(df)
+
     for col, base in [("Suspected", "suspected"), ("Probable", "probable"),
                       ("Confirmed", "confirmed"), ("Deaths", "deaths")]:
         if col not in df.columns:
@@ -215,3 +316,44 @@ def _norm_country(s):
         return cands[m[0]]
 
     return raw   # unrecognized -> keep as-is; the validator will flag it
+
+
+# ---------- COLUMN-SHIFT REPAIR ----------
+# A multi-word country name ("South Africa", "Central African Republic") is wider
+# than the Country column, so it pushes the first count into the neighbouring
+# cell. The result is a cell holding TWO "n (n)" figures while the next column is
+# empty. We detect that and push the surplus figure back where it belongs.
+
+_COUNT_TOKEN = re.compile(r"[\d,]+\s*\(\s*[\d,]+\s*\)")
+
+COUNT_COLUMNS = ["Suspected", "Probable", "Confirmed", "Deaths"]
+
+
+def _repair_shifted_counts(df):
+    """Redistribute count figures that OCR packed into the wrong column."""
+    cols = [c for c in COUNT_COLUMNS if c in df.columns]
+    if len(cols) < 2:
+        return df
+
+    for i in df.index:
+        # walk left-to-right; if a cell holds >1 figure, push the extras right
+        for j, col in enumerate(cols):
+            val = df.at[i, col]
+            if not isinstance(val, str):
+                continue
+            found = _COUNT_TOKEN.findall(val)
+            if len(found) <= 1:
+                continue
+
+            # keep the first figure here, cascade the rest into the columns to
+            # the right -- but only into cells that are currently empty, so we
+            # never overwrite a genuine value.
+            df.at[i, col] = found[0]
+            surplus = found[1:]
+            for nxt in cols[j + 1:]:
+                if not surplus:
+                    break
+                cur = df.at[i, nxt]
+                if not isinstance(cur, str) or not _COUNT_TOKEN.search(str(cur)):
+                    df.at[i, nxt] = surplus.pop(0)
+    return df

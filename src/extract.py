@@ -36,7 +36,10 @@ from pytesseract import Output
 
 
 DPI = 300
-MIN_CONF = 30          # drop very low-confidence OCR words
+MIN_CONF = 15          # keep low-confidence words: small isolated digits (e.g. "2 (1)") often
+                       # score ~25-30. Dropping them silently LOSES REAL DATA, which is
+                       # worse than admitting a slightly uncertain read -- the validator
+                       # downstream catches anything nonsensical.
 ROW_TOLERANCE = 28     # px: words within this vertical distance are the same row
 
 # The columns of the highlighted-events table, in order.
@@ -62,6 +65,15 @@ def _find_table_header(words):
     "Events Highlighted this week"). We anchor on the 'Highlighted' title and take
     the first header row BELOW it, so we never pick up the wrong table.
     """
+    # We want the "Events Highlighted this week" table specifically.
+    #
+    # A page may also carry a "New events since last issue" table with the SAME
+    # column headers. If we anchored on the wrong one we would silently harvest
+    # 2-3 rows of new events instead of the ~25 highlighted events. So we anchor
+    # on the word "Highlighted" and only accept header rows BELOW it.
+    #
+    # Note: some bulletins (seen in 2024) genuinely contain only the "New events"
+    # table and no highlighted table at all. For those we correctly return None.
     hl = words[words["text"].str.contains("Highlighted", case=False, na=False)]
     if hl.empty:
         return None, None

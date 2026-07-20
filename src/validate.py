@@ -159,6 +159,29 @@ def _is_number(x):
     return bool(re.fullmatch(r"-?\d+(\.\d+)?", str(x).strip()))
 
 
+def _check_disease(df, issues):
+    """Flag rows whose disease name could not be recognized.
+
+    A disease name that OCR mangled beyond recognition is marked UNKNOWN by
+    clean.py rather than silently inheriting the previous row's disease. Without
+    this check such a row looks perfectly valid (a real country, real numbers)
+    while carrying the WRONG disease label.
+    """
+    if "Agent/Syndrome" not in df.columns:
+        return
+    for i, val in df["Agent/Syndrome"].items():
+        if pd.isna(val) or str(val).strip() == "":
+            issues.append(dict(row=i, severity="ERROR", column="Agent/Syndrome",
+                               check="disease_missing", value=val,
+                               message="Disease name is blank"))
+        elif str(val).strip().upper() == "UNKNOWN":
+            issues.append(dict(row=i, severity="ERROR", column="Agent/Syndrome",
+                               check="disease_unrecognized", value=val,
+                               message="Disease name could not be recognized from the "
+                                       "OCR'd text - check the bulletin and add the "
+                                       "name to DISEASE_PATTERNS in clean.py"))
+
+
 def _check_country(df, issues):
     for i, val in df["Country"].items():
         if pd.isna(val):
@@ -284,6 +307,7 @@ def validate(df):
     _check_schema(df, issues)
     _check_date(df, issues)
     _check_country(df, issues)
+    _check_disease(df, issues)
     _check_type(df, issues)
     _check_risk(df, issues)
     _check_numeric_type(df, issues)

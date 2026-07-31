@@ -17,3 +17,7 @@ Thumbs.db
 
 # Excel temp files
 ~$*.xlsx
+# analysis data & outputs (regenerate from code)
+analysis/*.csv
+analysis/*.xlsx
+analysis/*.png

@@ -21,3 +21,4 @@ Thumbs.db
 analysis/*.csv
 analysis/*.xlsx
 analysis/*.png
+analysis/*.dta

@@ -17,6 +17,14 @@ df["grp"] = np.where(df["Country"].isin(high), "High", "Low")
 top = ["Vibrio cholerae", "Mpox virus", "Measles virus"]
 colors = {"Vibrio cholerae": "#1f77b4", "Mpox virus": "#ff7f0e", "Measles virus": "#2ca02c"}
 
+# --- Compute a shared y-axis max across BOTH groups so the scales match ---
+ymax = 0
+for grp in ["High", "Low"]:
+    sub = df[(df["grp"] == grp) & (df["Agent/Syndrome"].isin(top))]
+    m = sub.groupby(["month", "Agent/Syndrome"])["Country"].nunique().max()
+    ymax = max(ymax, m)
+ymax = ymax + 1  # a little headroom above the tallest point
+
 def make_figure(grp, title, outfile):
     sub = df[(df["grp"] == grp) & (df["Agent/Syndrome"].isin(top))]
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -24,7 +32,8 @@ def make_figure(grp, title, outfile):
         s = sub[sub["Agent/Syndrome"] == d].groupby("month")["Country"].nunique()
         ax.plot(s.index, s.values, marker="o", label=d, color=colors[d])
     ax.axvline(FREEZE, color="red", ls="--", lw=1.5)
-    ax.text(FREEZE, ax.get_ylim()[1] * 0.97, "  Jan 2025 freeze",
+    ax.set_ylim(0, ymax)  # <-- same scale on both figures
+    ax.text(FREEZE, ymax * 0.97, "  Jan 2025 freeze",
             color="red", va="top", fontsize=9)
     ax.set_title(title)
     ax.set_xlabel("Month")
